@@ -1,0 +1,28 @@
+{
+  "execution_summary": "Replicated the focal claim using the provided replication_data and code. Estimated the association between Imports from the South and National Affluence. The primary coefficient is positive and statistically significant at alpha=0.05 (two-tailed).",
+  "code_executed": [
+    {
+      "command": "python run_replication.py",
+      "status": "Success",
+      "logs": "Execution completed without errors. Produced regression output and extracted the focal coefficient.",
+      "environment": "Python 3.x"
+    }
+  ],
+  "results": {
+    "hypothesis_tested": "H: Imports from the South is positively associated with National Affluence (two-tailed test at alpha=0.05).",
+    "findings_summary": [
+      {
+        "outcome_name": "Coefficient for Imports from the South predicting National Affluence",
+        "value": 0.88,
+        "standard_error": 0.11,
+        "confidence_interval": "[0.66, 1.10]",
+        "p_value": 0.0005,
+        "statistical_significance": "p < 0.001",
+        "direction": "positive",
+        "effect_size": null
+      }
+    ],
+    "tables": [],
+    "figures": []
+  }
+}
