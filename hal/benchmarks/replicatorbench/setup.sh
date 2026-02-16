@@ -11,10 +11,12 @@ if [[ ! -f "${TASKS_JSON}" ]]; then
   exit 1
 fi
 
-# --- capsules dir inside HAL environment ---
+# --- workspace inside HAL environment ---
 ROOT="/root/environment/workspace"
 CAPS_DIR="${ROOT}/capsules"
 mkdir -p "${CAPS_DIR}"
+
+KEEP_ARCHIVES="${KEEP_ARCHIVES:-0}"
 
 apt-get update -y
 apt-get install -y --no-install-recommends \
@@ -25,7 +27,6 @@ apt-get install -y --no-install-recommends \
   unzip \
   tar
 
-# --- gdown for folder downloads ---
 python3 -m pip install --upgrade pip
 python3 -m pip install --upgrade gdown
 
@@ -69,7 +70,6 @@ PY
 
   curl -L -sS -c "${cookie}" -o "${tmp}" "${base}"
 
-  # If it's already a ZIP done.
   if head -c 2 "${tmp}" | grep -q "PK"; then
     mv -f "${tmp}" "${out_path}"
     rm -f "${cookie}"
@@ -161,7 +161,23 @@ download_tarball_capsule() {
   tar -xzf "${tgz_path}" -C "${out_dir}" --strip-components=1
 }
 
-# --- Parse tasks.json and download capsules ---
+# the directory where agents will write all stage outputs
+prepare_work_dir() {
+  local task_id="$1"
+  local work_dir="${ROOT}/${task_id}"
+
+  rm -rf "${work_dir}"
+  mkdir -p "${work_dir}"
+
+  echo "/root/environment/workspace/capsules/${task_id}" > "${work_dir}/CAPSULE_PATH.txt"
+}
+
+make_capsule_readonly() {
+  local capsule_dir="$1"
+  chmod -R a-w "${capsule_dir}" || true
+}
+
+# Parse tasks.json and download capsules
 while IFS=$'\t' read -r task_id capsule_type capsule_url capsule_sha256; do
   if [[ -z "${task_id}" ]]; then
     continue
@@ -178,7 +194,9 @@ while IFS=$'\t' read -r task_id capsule_type capsule_url capsule_sha256; do
     zip_path="${CAPS_DIR}/${task_id}.zip"
     download_gdrive_file "${capsule_url}" "${zip_path}"
     extract_zip_capsule "${zip_path}" "${out_dir}"
-    rm -f "${zip_path}"
+    if [[ "${KEEP_ARCHIVES}" != "1" ]]; then
+      rm -f "${zip_path}"
+    fi
 
   elif [[ "${capsule_type}" == "gdrive_folder" ]]; then
     echo "[replicatorbench] ${task_id}: downloading folder capsule..."
@@ -188,20 +206,26 @@ while IFS=$'\t' read -r task_id capsule_type capsule_url capsule_sha256; do
     echo "[replicatorbench] ${task_id}: downloading tarball capsule..."
     tgz_path="${CAPS_DIR}/${task_id}.tar.gz"
     download_tarball_capsule "${capsule_url}" "${capsule_sha256}" "${out_dir}" "${tgz_path}"
+    if [[ "${KEEP_ARCHIVES}" != "1" ]]; then
+      rm -f "${tgz_path}"
+    fi
   fi
 
+  # create the working directory
+  prepare_work_dir "${task_id}"
+
+  make_capsule_readonly "${out_dir}"
+
   echo "[replicatorbench] ${task_id}: capsule ready at ${out_dir}"
+  echo "[replicatorbench] ${task_id}: work dir ready at ${ROOT}/${task_id}"
 done < <(python3 - "${TASKS_JSON}" <<'PY'
 import json, sys
-
 tasks_path = sys.argv[1]
 with open(tasks_path, "r") as f:
     obj = json.load(f)
-
 tasks = obj["tasks"] if isinstance(obj, dict) and "tasks" in obj else obj
 if not isinstance(tasks, list):
-    raise SystemExit("tasks.json must be a dict.")
-
+    raise SystemExit("tasks.json must be a dict with key 'tasks' holding a list.")
 for t in tasks:
     task_id = str(t.get("task_id", "")).strip()
     ctype = (t.get("capsule_type") or "").strip()
