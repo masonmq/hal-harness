@@ -16,6 +16,18 @@ ROOT="/root/environment/workspace"
 CAPS_DIR="${ROOT}/capsules"
 mkdir -p "${CAPS_DIR}"
 
+# --- Make JSON schemas available to agents at runtime ---
+TEMPLATE_SRC="${BENCH_DIR}/templates"
+TEMPLATE_DST="${ROOT}/replicatorbench_templates"
+rm -rf "${TEMPLATE_DST}"
+mkdir -p "${TEMPLATE_DST}"
+if [[ -d "${TEMPLATE_SRC}" ]]; then
+  cp -R "${TEMPLATE_SRC}/." "${TEMPLATE_DST}/"
+  echo "[replicatorbench] templates copied to ${TEMPLATE_DST}"
+else
+  echo "[replicatorbench] WARNING: templates dir not found at ${TEMPLATE_SRC} (skipping copy)"
+fi
+
 KEEP_ARCHIVES="${KEEP_ARCHIVES:-0}"
 
 apt-get update -y
@@ -70,12 +82,14 @@ PY
 
   curl -L -sS -c "${cookie}" -o "${tmp}" "${base}"
 
+  # a zip ? accept it directly
   if head -c 2 "${tmp}" | grep -q "PK"; then
     mv -f "${tmp}" "${out_path}"
     rm -f "${cookie}"
     return 0
   fi
 
+  # virus-scan warning flow
   if grep -q "Google Drive can't scan this file for viruses" "${tmp}"; then
     local confirm uuid
     confirm="$(sed -n 's/.*name="confirm" value="\([^"]*\)".*/\1/p' "${tmp}" | head -n 1)"
@@ -135,6 +149,7 @@ extract_zip_capsule() {
 
   rm -rf "${tmp}"
 
+  # Fix double extension artifacts
   if compgen -G "${out_dir}/*.pdf.pdf" > /dev/null; then
     for f in "${out_dir}"/*.pdf.pdf; do
       mv -f "${f}" "${f%.pdf}"
@@ -161,15 +176,30 @@ download_tarball_capsule() {
   tar -xzf "${tgz_path}" -C "${out_dir}" --strip-components=1
 }
 
-# the directory where agents will write all stage outputs
-prepare_work_dir() {
-  local task_id="$1"
-  local work_dir="${ROOT}/${task_id}"
+prepare_shared_study_dir() {
+  local capsule_id="$1"
+  local work_dir="${ROOT}/${capsule_id}"
 
   rm -rf "${work_dir}"
   mkdir -p "${work_dir}"
 
-  echo "/root/environment/workspace/capsules/${task_id}" > "${work_dir}/CAPSULE_PATH.txt"
+  echo "${CAPS_DIR}/${capsule_id}" > "${work_dir}/CAPSULE_PATH.txt"
+}
+
+prepare_task_symlink_to_study() {
+  local task_id="$1"
+  local capsule_id="$2"
+
+  # If task_id == capsule_id, no need to symlink
+  if [[ "${task_id}" == "${capsule_id}" ]]; then
+    return 0
+  fi
+
+  local task_dir="${ROOT}/${task_id}"
+  local study_dir="${ROOT}/${capsule_id}"
+
+  rm -rf "${task_dir}"
+  ln -s "${study_dir}" "${task_dir}"
 }
 
 make_capsule_readonly() {
@@ -177,62 +207,98 @@ make_capsule_readonly() {
   chmod -R a-w "${capsule_dir}" || true
 }
 
-# Parse tasks.json and download capsules
-while IFS=$'\t' read -r task_id capsule_type capsule_url capsule_sha256; do
+declare -A DOWNLOADED=()
+declare -A PREPARED_STUDYDIR=()
+
+# Parse tasks.json and:
+#  1) download capsule once per capsule_id into /capsules/<capsule_id>/
+#  2) create output dir once per capsule_id at /workspace/<capsule_id>/
+while IFS=$'\t' read -r task_id capsule_id capsule_type capsule_url capsule_sha256; do
   if [[ -z "${task_id}" ]]; then
     continue
   fi
-  if [[ -z "${capsule_url}" ]]; then
-    echo "[replicatorbench] ${task_id}: no capsule_url (skipping download)"
-    continue
+
+  if [[ -z "${capsule_id}" ]]; then
+    capsule_id="${task_id}"
   fi
 
-  out_dir="${CAPS_DIR}/${task_id}"
-
-  if [[ "${capsule_type}" == "gdrive_zip" ]]; then
-    echo "[replicatorbench] ${task_id}: downloading ZIP capsule..."
-    zip_path="${CAPS_DIR}/${task_id}.zip"
-    download_gdrive_file "${capsule_url}" "${zip_path}"
-    extract_zip_capsule "${zip_path}" "${out_dir}"
-    if [[ "${KEEP_ARCHIVES}" != "1" ]]; then
-      rm -f "${zip_path}"
-    fi
-
-  elif [[ "${capsule_type}" == "gdrive_folder" ]]; then
-    echo "[replicatorbench] ${task_id}: downloading folder capsule..."
-    download_gdrive_folder "${capsule_url}" "${out_dir}"
-
-  else
-    echo "[replicatorbench] ${task_id}: downloading tarball capsule..."
-    tgz_path="${CAPS_DIR}/${task_id}.tar.gz"
-    download_tarball_capsule "${capsule_url}" "${capsule_sha256}" "${out_dir}" "${tgz_path}"
-    if [[ "${KEEP_ARCHIVES}" != "1" ]]; then
-      rm -f "${tgz_path}"
-    fi
+  # Shared per-study directory
+  if [[ -z "${PREPARED_STUDYDIR[${capsule_id}]+x}" ]]; then
+    prepare_shared_study_dir "${capsule_id}"
+    PREPARED_STUDYDIR["${capsule_id}"]=1
+    echo "[replicatorbench] prepared shared study dir: ${ROOT}/${capsule_id}"
   fi
 
-  # create the working directory
-  prepare_work_dir "${task_id}"
+  # Per-task directory -> shared dir symlink
+  #prepare_task_symlink_to_study "${task_id}" "${capsule_id}"
 
-  make_capsule_readonly "${out_dir}"
+  # Download capsule only once per capsule_id
+  if [[ -z "${DOWNLOADED[${capsule_id}]+x}" ]]; then
+    if [[ -z "${capsule_url}" ]]; then
+      echo "[replicatorbench] ${task_id}: no capsule_url (skipping download)"
+      DOWNLOADED["${capsule_id}"]=1
+      continue
+    fi
 
-  echo "[replicatorbench] ${task_id}: capsule ready at ${out_dir}"
-  echo "[replicatorbench] ${task_id}: work dir ready at ${ROOT}/${task_id}"
+    out_dir="${CAPS_DIR}/${capsule_id}"
+
+    if [[ "${capsule_type}" == "gdrive_zip" ]]; then
+      echo "[replicatorbench] ${capsule_id}: downloading ZIP capsule..."
+      zip_path="${CAPS_DIR}/${capsule_id}.zip"
+      download_gdrive_file "${capsule_url}" "${zip_path}"
+      extract_zip_capsule "${zip_path}" "${out_dir}"
+      if [[ "${KEEP_ARCHIVES}" != "1" ]]; then
+        rm -f "${zip_path}"
+      fi
+
+    elif [[ "${capsule_type}" == "gdrive_folder" ]]; then
+      echo "[replicatorbench] ${capsule_id}: downloading folder capsule..."
+      download_gdrive_folder "${capsule_url}" "${out_dir}"
+
+    else
+      echo "[replicatorbench] ${capsule_id}: downloading tarball capsule..."
+      tgz_path="${CAPS_DIR}/${capsule_id}.tar.gz"
+      download_tarball_capsule "${capsule_url}" "${capsule_sha256}" "${out_dir}" "${tgz_path}"
+      if [[ "${KEEP_ARCHIVES}" != "1" ]]; then
+        rm -f "${tgz_path}"
+      fi
+    fi
+
+    make_capsule_readonly "${out_dir}"
+    DOWNLOADED["${capsule_id}"]=1
+
+    echo "[replicatorbench] ${capsule_id}: capsule ready at ${out_dir}"
+  fi
+
 done < <(python3 - "${TASKS_JSON}" <<'PY'
 import json, sys
+
 tasks_path = sys.argv[1]
 with open(tasks_path, "r") as f:
     obj = json.load(f)
+
 tasks = obj["tasks"] if isinstance(obj, dict) and "tasks" in obj else obj
 if not isinstance(tasks, list):
     raise SystemExit("tasks.json must be a dict with key 'tasks' holding a list.")
+
+STAGE_SUFFIXES = ["_extract", "_web_search", "_design", "_execute", "_interpret"]
+
+def derive_capsule_id(task_id: str) -> str:
+    for s in STAGE_SUFFIXES:
+        if task_id.endswith(s):
+            return task_id[: -len(s)]
+    return task_id
+
 for t in tasks:
     task_id = str(t.get("task_id", "")).strip()
+    if not task_id:
+        continue
+    capsule_id = str(t.get("capsule_id", "")).strip() or derive_capsule_id(task_id)
     ctype = (t.get("capsule_type") or "").strip()
     url = (t.get("capsule_url") or "").strip()
     sha = t.get("capsule_sha256", None)
     sha_s = "" if sha is None else str(sha).strip()
-    print(f"{task_id}\t{ctype}\t{url}\t{sha_s}")
+    print(f"{task_id}\t{capsule_id}\t{ctype}\t{url}\t{sha_s}")
 PY
 )
 
