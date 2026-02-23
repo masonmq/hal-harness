@@ -7,6 +7,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .base_benchmark import BaseBenchmark
 
+from hal.benchmarks.replicatorbench.validator.evaluate_extract import extract_from_human_postreg
+from hal.benchmarks.replicatorbench.validator.evaluate_design import extract_from_human_prereg
+from hal.benchmarks.replicatorbench.validator.evaluate_execute import run_evaluate_execute
+from hal.benchmarks.replicatorbench.validator.evaluate_interpret import extract_from_human_report
+
+
 # Evaluation mode:
 #   - "offline": pre-extracted GT JSON (execute stage only)
 #   - "llm": LLM judge
@@ -336,6 +342,8 @@ class ReplicatorBenchmark(BaseBenchmark):
 
     # scring with llm 
     def _score_llm_hook(self, study_path: str) -> Dict[str, Any]:
+        _gt_path
+        extract_from_human_postreg()
 
         return {"label": "unmet", "reason": "LLM scoring scaffold."}
 
@@ -375,110 +383,140 @@ class ReplicatorBenchmark(BaseBenchmark):
 
         info["error"] = "wrong_json_type"
         return info
+    
+    def summarize_eval_execute(self, eval_data):
+        eval_scores = {}
+        for sub_stage, sub_stage_eval_data in eval_data.items():
+            eval_scores[f"execute_{sub_stage}"] = {
+                "aspect_scores": {}
+            }
+            sub_stage_scores = []
+            for aspect in sub_stage_eval_data:
+                aspect_scores = []
+                for rubric_id, rubric_info in sub_stage_eval_data[aspect].items():
+                    aspect_scores.append(rubric_info['score'])
+                aspect_avg = sum(aspect_scores)/len(aspect_scores)
+                eval_scores[f"execute_{sub_stage}"]["aspect_scores"][aspect] = aspect_avg
+                sub_stage_scores.append(aspect_avg)
+            eval_scores[f"execute_{sub_stage}"]["avg_score"] = sum(sub_stage_scores)/len(sub_stage_scores)
+        return eval_scores
+
+    def _to_float_or_none(self, x):
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str):
+            s = x.strip()
+            if s.upper() in {"NA", "N/A", ""}:
+                return None
+            return float(s)  # will still raise if it's something else
+        return None
+
+    def summarize_eval_scores(self, study_path):
+        stages = ["extract", "design", "execute", "interpret"]
+        eval_summary = {}
+        for stage in stages:
+            with open(f"{study_path}/llm_eval/{stage}_llm_eval.json") as f:
+                eval_json = json.load(f)
+            if stage == "execute":
+                eval_data = {
+                    "design": eval_json["evaluate_design"],
+                    "execute": eval_json["execute"] 
+                }
+                eval_summary.update(self.summarize_eval_execute(eval_data))
+            else:
+                aspect_totals = {}
+                for eval_field, eval_info in eval_json.items():
+                    aspect = eval_field.split(".")[0]
+                    if aspect not in aspect_totals:
+                        aspect_totals[aspect] = [0.0, 0.0]
+                    score = self._to_float_or_none(eval_info.get("score"))
+                    if score is None:
+                        continue
+                    aspect_totals[aspect][0] += score
+                    aspect_totals[aspect][1] += 3.0
+
+                eval_summary[stage] = {"aspect_scores": {}}
+                stage_scores = []
+                for aspect, (score_sum, max_sum) in aspect_totals.items():
+                    aspect_avg = (score_sum / max_sum) if max_sum else 0.0
+                    eval_summary[stage]["aspect_scores"][aspect] = aspect_avg
+                    stage_scores.append(aspect_avg)
+
+                eval_summary[stage]["avg_score"] = (
+                    sum(stage_scores) / len(stage_scores) if stage_scores else 0.0
+                )
+        with open(f"{study_path}/llm_eval/eval_summary.json", "w") as fout:
+            json.dump(eval_summary, fout, indent =2)
+        return eval_summary
+            
 
     def _evaluate_task_placeholder(
         self, task_id: str, parsed_ptr: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
-
+        STUDY_PATH  = os.path.join(self.TARGET_ROOT, "capsules", task_id)
         # Extract stage
         extract_checks = [
             self._stage_check_json(task_id, "extract", "post_registration.json", parsed_ptr, allow_list=False),
             self._stage_check_json(task_id, "extract", "merged-urls.json", parsed_ptr, allow_list=True),
         ]
-        extract_score = 1.0 if all(c["ok"] for c in extract_checks) else 0.0
+        # extract_score = 1.0 if all(c["ok"] for c in extract_checks) else 0.0
+        if all(c["ok"] for c in extract_checks):
+            gt_post_reg_path = os.path.join(STUDY_PATH, "expected_post_registration.json")
+            extract_from_human_postreg(extract_checks[0]['path'], gt_post_reg_path, STUDY_PATH)
 
         # Design stage
         design_checks = [
             self._stage_check_json(task_id, "design", "replication_info.json", parsed_ptr, allow_list=False),
         ]
-        design_score = 1.0 if all(c["ok"] for c in design_checks) else 0.0
+        # design_score = 1.0 if all(c["ok"] for c in design_checks) else 0.0
+        
+        if all(c["ok"] for c in design_checks):
+            base_path = os.path.join(STUDY_PATH, "human_preregistration")
+            pdf_path = base_path + ".pdf"
+            docx_path = base_path + ".docx"
+
+            if os.path.exists(pdf_path):
+                gt_pre_reg_path = pdf_path
+            elif os.path.exists(docx_path):
+                gt_pre_reg_path = docx_path
+            else:
+                gt_pre_reg_path = None  
+            if gt_pre_reg_path:
+                extract_from_human_prereg(design_checks[0]['path'], gt_pre_reg_path, STUDY_PATH)
 
         # Execute stage (structural + optional GT compare)
         execute_check = self._stage_check_json(task_id, "execute", "execution_results.json", parsed_ptr, allow_list=False)
-        execute_score = 1.0 if execute_check["ok"] else 0.0
-
-        execute_details: Dict[str, Any] = {"structural_ok": execute_check["ok"], "gt_compare": None}
-        gt_label = None
-        pred_label = None
-        execute_correct_vs_gt = None
-
+        # execute_score = 1.0 if execute_check["ok"] else 0.0
         if execute_check["ok"]:
-            exec_path = execute_check["path"]
-            execution_results_obj = self._read_json_any(exec_path)
-            execution_results = execution_results_obj if isinstance(execution_results_obj, dict) else None
-
-            gt = self._ground_truth.get(task_id)
-            if isinstance(gt, dict) and execution_results is not None:
-                gt_label = str(gt.get("label", "")).strip().lower()
-                if gt_label in {"met", "unmet"}:
-                    if REPLICATORBENCH_EVAL_MODE == "llm":
-                        study_path = os.path.join(self.TARGET_ROOT, "capsules", task_id)
-                        score = self._score_llm_hook(study_path)
-                    else:
-                        score = self._score_offline_execute(execution_results, gt)
-
-                    pred_label = str(score.get("label", "")).strip().lower()
-                    execute_details["gt_compare"] = {
-                        "ground_truth_label": gt_label,
-                        "predicted_label": pred_label,
-                        "score_details": score,
-                    }
-                    execute_correct_vs_gt = (gt_label == pred_label)
-                    # If we have GT, the execute stage score is whether it matched GT label.
-                    execute_score = 1.0 if execute_correct_vs_gt else 0.0
-
+            run_evaluate_execute(STUDY_PATH)
+        
         # Interpret stage
         interpret_checks = [
             self._stage_check_json(task_id, "interpret", "interpret_results.json", parsed_ptr, allow_list=False),
         ]
-        interpret_score = 1.0 if all(c["ok"] for c in interpret_checks) else 0.0
+        # interpret_score = 1.0 if all(c["ok"] for c in interpret_checks) else 0.0
+        if all(c["ok"] for c in interpret_checks):
+            base_path = os.path.join(STUDY_PATH, "human_report")
+            pdf_path = base_path + ".pdf"
+            docx_path = base_path + ".docx"
 
-        stage_scores = {
-            "extract": extract_score,
-            "design": design_score,
-            "execute": execute_score,
-            "interpret": interpret_score,
-        }
+            if os.path.exists(pdf_path):
+                gt_report_path = pdf_path
+            elif os.path.exists(docx_path):
+                gt_report_path = docx_path
+            else:
+                gt_report_path = None  
+            if gt_report_path:
+                extract_from_human_report(interpret_checks[0]['path'], gt_report_path, STUDY_PATH)
 
-        overall_score = sum(stage_scores.values()) / 4.0
+    
 
-        eval_summary = {
-            "task_id": task_id,
-            "stage_scores": stage_scores,
-            "overall_score": overall_score,
-            "stage_checks": {
-                "extract": extract_checks,
-                "design": design_checks,
-                "execute": [execute_check],
-                "interpret": interpret_checks,
-            },
-            "execute_details": execute_details,
-            "eval_mode": REPLICATORBENCH_EVAL_MODE,
-        }
-
-        # write eval_summary.json 
-        try:
-            out_dir = self._canonical_task_dir(task_id)
-            os.makedirs(out_dir, exist_ok=True)
-            out_path = os.path.join(out_dir, "eval_summary.json")
-            with open(out_path, "w") as f:
-                json.dump(eval_summary, f, indent=2)
-            eval_summary["eval_summary_path"] = out_path
-        except Exception:
-            pass
-
+        eval_summary = self.summarize_eval_scores(STUDY_PATH)
         # treat as pass only if all stages score 1.0
-        all_stages_ok = all(v >= 1.0 for v in stage_scores.values())
 
-        return {
-            "correct": bool(all_stages_ok),
-            "overall_score": overall_score,
-            "eval_summary": eval_summary,
-            "ground_truth_label": gt_label,
-            "predicted_label": pred_label,
-            "execute_correct_vs_gt": execute_correct_vs_gt,
-            "received_pointer": parsed_ptr,
-        }
+        return eval_summary
 
     # HAL API
     def evaluate_output(self, agent_output: Dict[str, Any], run_id: str) -> Dict[str, Any]:

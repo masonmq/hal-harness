@@ -94,7 +94,7 @@ class BenchmarkManager:
             benchmark = ColBenchBenchmark(self.agent_dir, self.config, benchmark_name)
 
         elif benchmark_name == "replicatorbench":
-            from .benchmarks.replicatorbench import ReplicatorBenchmark
+            from .benchmarks.run_replicatorbench import ReplicatorBenchmark
 
             benchmark = ReplicatorBenchmark(self.agent_dir, self.config)
 
