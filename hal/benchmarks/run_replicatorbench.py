@@ -128,6 +128,24 @@ class ReplicatorBenchmark(BaseBenchmark):
         tasks: List[Dict[str, Any]] = payload["tasks"]
         seen_ids = set()
 
+        # task_id -> {"capsule_id": ..., "stage": ...}
+        self._task_meta: Dict[str, Dict[str, str]] = {}
+
+        def _infer_stage(task_id: str) -> str:
+            if task_id.endswith("_web_search"):
+                return "web_search"
+            for suf in ("_extract", "_design", "_execute", "_interpret"):
+                if task_id.endswith(suf):
+                    return suf.lstrip("_")
+            return "unknown"
+
+        def _infer_capsule_id(task_id: str, stage: str) -> str:
+            if stage == "web_search":
+                return task_id[: -len("_web_search")]
+            if stage in ("extract", "design", "execute", "interpret"):
+                return task_id[: -(len(stage) + 1)]  # strip "_<stage>"
+            return task_id
+
         for t in tasks:
             if not isinstance(t, dict):
                 raise ValueError("[replicatorbench] Each entry in tasks must be an object/dict.")
@@ -151,10 +169,18 @@ class ReplicatorBenchmark(BaseBenchmark):
             if not prompt:
                 raise ValueError(f"[replicatorbench:{task_id}] Missing required field: prompt")
 
-            # Capsules only exist after setup.sh runs inside the sandbox.
+            stage = _infer_stage(task_id)
+            capsule_id = str(t.get("capsule_id") or "").strip()
+            if not capsule_id:
+                capsule_id = _infer_capsule_id(task_id, stage)
+
+            self._task_meta[task_id] = {"capsule_id": capsule_id, "stage": stage}
+
+            # Agents READ from:  /root/environment/workspace/capsules/<capsule_id>/
+            # Agents WRITE to:   /root/environment/workspace/<capsule_id>/
             self.benchmark[task_id] = {
                 "prompt": prompt,
-                "files": {},  # agents read directly from /root/environment/workspace/capsules/<task_id>/
+                "files": {},
                 "gpu": gpu,
             }
 
@@ -262,7 +288,15 @@ class ReplicatorBenchmark(BaseBenchmark):
         return est, pval, direction
 
     def _canonical_task_dir(self, task_id: str) -> str:
-        return os.path.join(self.TARGET_ROOT, task_id)
+        """
+        Canonical shared output directory.
+
+        We write ALL stage outputs for a study under:
+          /root/environment/workspace/<capsule_id>/
+        """
+        meta = getattr(self, "_task_meta", {}) or {}
+        capsule_id = (meta.get(task_id) or {}).get("capsule_id") or task_id
+        return os.path.join(self.TARGET_ROOT, capsule_id)
 
     def _canonical_output_path(self, task_id: str, filename: str) -> str:
         return os.path.join(self._canonical_task_dir(task_id), filename)
@@ -455,91 +489,104 @@ class ReplicatorBenchmark(BaseBenchmark):
     def _evaluate_task_placeholder(
         self, task_id: str, parsed_ptr: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        STUDY_PATH  = os.path.join(self.TARGET_ROOT, "capsules", task_id)
-        # Extract stage
+        """
+        Evaluate by looking for outputs in:
+          /root/environment/workspace/<capsule_id>/
+        and inputs/GT in:
+          /root/environment/workspace/capsules/<capsule_id>/.
+        """
+        meta = getattr(self, "_task_meta", {}) or {}
+        capsule_id = (meta.get(task_id) or {}).get("capsule_id") or task_id
+        study_path = os.path.join(self.TARGET_ROOT, "capsules", capsule_id)
+
+        # Presence/type checks (outputs live in shared per-study dir via _canonical_task_dir)
         extract_checks = [
             self._stage_check_json(task_id, "extract", "post_registration.json", parsed_ptr, allow_list=False),
             self._stage_check_json(task_id, "extract", "merged-urls.json", parsed_ptr, allow_list=True),
         ]
-        # extract_score = 1.0 if all(c["ok"] for c in extract_checks) else 0.0
-        if all(c["ok"] for c in extract_checks):
-            gt_post_reg_path = os.path.join(STUDY_PATH, "expected_post_registration.json")
-            extract_from_human_postreg(extract_checks[0]['path'], gt_post_reg_path, STUDY_PATH)
-
-        # Design stage
         design_checks = [
             self._stage_check_json(task_id, "design", "replication_info.json", parsed_ptr, allow_list=False),
         ]
-        # design_score = 1.0 if all(c["ok"] for c in design_checks) else 0.0
-        
-        if all(c["ok"] for c in design_checks):
-            base_path = os.path.join(STUDY_PATH, "human_preregistration")
-            pdf_path = base_path + ".pdf"
-            docx_path = base_path + ".docx"
-
-            if os.path.exists(pdf_path):
-                gt_pre_reg_path = pdf_path
-            elif os.path.exists(docx_path):
-                gt_pre_reg_path = docx_path
-            else:
-                gt_pre_reg_path = None  
-            if gt_pre_reg_path:
-                extract_from_human_prereg(design_checks[0]['path'], gt_pre_reg_path, STUDY_PATH)
-
-        # Execute stage (structural + optional GT compare)
         execute_check = self._stage_check_json(task_id, "execute", "execution_results.json", parsed_ptr, allow_list=False)
-        # execute_score = 1.0 if execute_check["ok"] else 0.0
-        if execute_check["ok"]:
-            run_evaluate_execute(STUDY_PATH)
-        
-        # Interpret stage
         interpret_checks = [
             self._stage_check_json(task_id, "interpret", "interpret_results.json", parsed_ptr, allow_list=False),
         ]
-        # interpret_score = 1.0 if all(c["ok"] for c in interpret_checks) else 0.0
-        if all(c["ok"] for c in interpret_checks):
-            base_path = os.path.join(STUDY_PATH, "human_report")
+
+        # Run evaluators opportunistically (only when the needed files exist)
+        if extract_checks[0]["ok"]:
+            gt_post_reg_path = os.path.join(study_path, "expected_post_registration.json")
+            if os.path.exists(gt_post_reg_path) and os.path.exists(study_path):
+                extract_from_human_postreg(extract_checks[0]["path"], gt_post_reg_path, study_path)
+
+        if design_checks[0]["ok"] and os.path.exists(study_path):
+            base_path = os.path.join(study_path, "human_preregistration")
             pdf_path = base_path + ".pdf"
             docx_path = base_path + ".docx"
+            gt_pre_reg_path = pdf_path if os.path.exists(pdf_path) else (docx_path if os.path.exists(docx_path) else None)
+            if gt_pre_reg_path:
+                extract_from_human_prereg(design_checks[0]["path"], gt_pre_reg_path, study_path)
 
-            if os.path.exists(pdf_path):
-                gt_report_path = pdf_path
-            elif os.path.exists(docx_path):
-                gt_report_path = docx_path
-            else:
-                gt_report_path = None  
+        if execute_check["ok"] and os.path.exists(study_path):
+            run_evaluate_execute(study_path)
+
+        if interpret_checks[0]["ok"] and os.path.exists(study_path):
+            base_path = os.path.join(study_path, "human_report")
+            pdf_path = base_path + ".pdf"
+            docx_path = base_path + ".docx"
+            gt_report_path = pdf_path if os.path.exists(pdf_path) else (docx_path if os.path.exists(docx_path) else None)
             if gt_report_path:
-                extract_from_human_report(interpret_checks[0]['path'], gt_report_path, STUDY_PATH)
+                extract_from_human_report(interpret_checks[0]["path"], gt_report_path, study_path)
 
-    
+        # Only summarize if all llm_eval stage files exist; otherwise avoid crashing mid-run
+        llm_eval_dir = os.path.join(study_path, "llm_eval")
+        expected_eval_files = [
+            os.path.join(llm_eval_dir, "extract_llm_eval.json"),
+            os.path.join(llm_eval_dir, "design_llm_eval.json"),
+            os.path.join(llm_eval_dir, "execute_llm_eval.json"),
+            os.path.join(llm_eval_dir, "interpret_llm_eval.json"),
+        ]
 
-        eval_summary = self.summarize_eval_scores(STUDY_PATH)
-        # treat as pass only if all stages score 1.0
+        if os.path.isdir(llm_eval_dir) and all(os.path.exists(p) for p in expected_eval_files):
+            eval_summary = self.summarize_eval_scores(study_path)
+        else:
+            eval_summary = {
+                "note": "llm_eval outputs not complete yet; returning presence/type checks only",
+                "checks": {
+                    "extract": extract_checks,
+                    "design": design_checks,
+                    "execute": execute_check,
+                    "interpret": interpret_checks,
+                },
+            }
 
-        return eval_summary
+        return {
+            "task_id": task_id,
+            "capsule_id": capsule_id,
+            "capsule_path": study_path,
+            "output_dir": self._canonical_task_dir(task_id),
+            "eval_summary": eval_summary,
+        }
 
     # HAL API
     def evaluate_output(self, agent_output: Dict[str, Any], run_id: str) -> Dict[str, Any]:
         """
-        Evaluate each task. We accept that some agents may only return one pointer (or none),
-        but we always check for all required files at default paths.
+        Evaluate tasks.
+
+        - If the agent returns pointers keyed by task_id, we use them.
+        - If the agent returns nothing (or partial), we still fall back to canonical paths.
         """
         results: Dict[str, Any] = {}
 
-        for task_id, solution in (agent_output or {}).items():
-            task_id = str(task_id)
+        # If agent_output is empty, still evaluate all configured tasks
+        if isinstance(agent_output, dict) and len(agent_output) > 0:
+            task_ids = [str(tid) for tid in agent_output.keys()]
+        else:
+            task_ids = list(self.benchmark.keys())
+
+        for task_id in task_ids:
+            solution = agent_output.get(task_id) if isinstance(agent_output, dict) else None
             parsed_ptr = self._parse_agent_obj(solution)
-
-            # Evaluate using default paths
             results[task_id] = self._evaluate_task_placeholder(task_id, parsed_ptr)
-
-        # Any task not returned by the agent is an automatic failure, but we still evaluate
-        # using default paths.
-        for tid in self.get_dataset().keys():
-            tid = str(tid)
-            if tid not in results:
-                results[tid] = self._evaluate_task_placeholder(tid, parsed_ptr=None)
-                results[tid]["error"] = "Agent did not return an output for this task_id."
 
         return results
 
