@@ -1,9 +1,7 @@
 #!/bin/bash
 
-# Ensure /workspace exists
 mkdir -p /workspace
 
-# Link the container's built-in runner into /workspace so docker_runner can execute it
 if [ ! -f /workspace/run_agent.py ]; then
   for cand in \
     /root/environment/workspace/run_agent.py \
@@ -19,7 +17,6 @@ fi
 
 set -euo pipefail
 
-# --- Hard-disable Weave by shadowing the module (prevents any wandb login) ---
 cat > /workspace/weave.py <<'PY'
 from contextlib import contextmanager
 
@@ -39,12 +36,10 @@ if [[ ! -f "${TASKS_JSON}" ]]; then
   exit 1
 fi
 
-# --- workspace inside HAL environment ---
 ROOT="/workspace"
 CAPS_DIR="${ROOT}/capsules"
 mkdir -p "${CAPS_DIR}"
 
-# --- Make JSON schemas available to agents at runtime ---
 TEMPLATE_SRC="${BENCH_DIR}/templates"
 TEMPLATE_DST="${ROOT}/replicatorbench_templates"
 rm -rf "${TEMPLATE_DST}"
@@ -110,7 +105,6 @@ PY
 
   curl -L -sS -c "${cookie}" -o "${tmp}" "${base}"
 
-  # a zip ? accept it directly
   if head -c 2 "${tmp}" | grep -q "PK"; then
     mv -f "${tmp}" "${out_path}"
     rm -f "${cookie}"
@@ -256,9 +250,6 @@ while IFS=$'\t' read -r task_id capsule_id capsule_type capsule_url capsule_sha2
     PREPARED_STUDYDIR["${capsule_id}"]=1
     echo "[replicatorbench] prepared shared study dir: ${ROOT}/${capsule_id}"
   fi
-
-  # Per-task directory -> shared dir symlink
-  #prepare_task_symlink_to_study "${task_id}" "${capsule_id}"
 
   # Download capsule only once per capsule_id
   if [[ -z "${DOWNLOADED[${capsule_id}]+x}" ]]; then

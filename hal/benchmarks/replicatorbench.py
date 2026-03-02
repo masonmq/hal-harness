@@ -6,8 +6,6 @@ import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .base_benchmark import BaseBenchmark
-
-# --- IMPORTANT: allow submodule imports from hal/benchmarks/replicatorbench/ ---
 import os as _os
 __path__ = [_os.path.join(_os.path.dirname(__file__), "replicatorbench")]
 
@@ -16,7 +14,6 @@ from hal.benchmarks.replicatorbench.validator.evaluate_design import extract_fro
 from hal.benchmarks.replicatorbench.validator.evaluate_execute import run_evaluate_execute
 from hal.benchmarks.replicatorbench.validator.evaluate_interpret import extract_from_human_report
 
-# add near the top of run_replicatorbench.py
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -24,35 +21,6 @@ GT_REPO_SLUG = os.getenv("REPLICATORBENCH_GT_REPO_SLUG", "").strip()
 GT_REF_OVERRIDE = os.getenv("REPLICATORBENCH_GT_REF", "").strip()
 GT_TOKEN = os.getenv("REPLICATORBENCH_GT_TOKEN", "").strip()  # optional, for private repos
 
-def _repo_slug_from_url(capsule_url: str) -> str:
-    # accepts https://github.com/org/repo or https://github.com/org/repo.git
-    s = (capsule_url or "").strip()
-    if s.startswith("https://github.com/"):
-        s = s[len("https://github.com/"):]
-    s = s.rstrip("/")
-    if s.endswith(".git"):
-        s = s[:-4]
-    return s  # org/repo
-
-def _download(url: str, dst_path: str, token: str = "") -> bool:
-    try:
-        headers = {}
-        if token:
-            headers["Authorization"] = f"token {token}"
-        req = Request(url, headers=headers)
-        with urlopen(req) as r, open(dst_path, "wb") as f:
-            f.write(r.read())
-        return True
-    except (HTTPError, URLError):
-        return False
-
-def _raw_url(repo_slug: str, ref: str, path_in_repo: str) -> str:
-    return f"https://raw.githubusercontent.com/{repo_slug}/{ref}/{path_in_repo}"
-
-
-# Evaluation mode:
-#   - "offline": pre-extracted GT JSON (execute stage only)
-#   - "llm": LLM judge
 REPLICATORBENCH_EVAL_MODE = os.getenv("REPLICATORBENCH_EVAL_MODE", "offline").strip().lower()
 
 
@@ -84,12 +52,7 @@ class ReplicatorBenchmark(BaseBenchmark):
     Agent return to harness:
       - we accept either:
           { "<task_id>": { "execution_results_path": "<abs path>", ... } }
-        or returning nothing but still writing files to the required locations.
         This evaluator will fall back to the canonical paths under /workspace/<task_id>/.
-
-    Ground truth contract (private to benchmark, not visible to agent):
-      - execute-stage GT lives in:
-          hal/benchmarks/replicatorbench/ground_truth/execute_ground_truth.json
 
     Current scoring behavior:
       - Placeholder "eval_summary-like" scoring for all stages:
@@ -99,7 +62,6 @@ class ReplicatorBenchmark(BaseBenchmark):
 
     TARGET_ROOT = "/workspace"
 
-    # Required outputs per stage
     REQUIRED_OUTPUTS = {
         "extract": ["post_registration.json", "merged-urls.json"],
         "design": ["replication_info.json"],
@@ -107,7 +69,6 @@ class ReplicatorBenchmark(BaseBenchmark):
         "interpret": ["interpret_results.json"],
     }
 
-    # Optional: agent-return pointer keys we understand
     POINTER_KEYS = {
         "post_registration.json": ["post_registration_path"],
         "merged-urls.json": ["merged_urls_path", "merged-urls_path"],
@@ -124,20 +85,15 @@ class ReplicatorBenchmark(BaseBenchmark):
         self.setup_script = "hal/benchmarks/replicatorbench/setup.sh"
         self.config = config or {}
 
-        # dataset: {task_id: {"prompt": ..., "files": ..., "gpu": ...}}
         self.benchmark: Dict[str, Dict[str, Any]] = {}
 
-        # ground truth: {task_id: {...}}
         self._ground_truth: Dict[str, Dict[str, Any]] = {}
 
         self._bench_dir = os.path.join(os.path.dirname(__file__), "replicatorbench")
         self._tasks_path = os.path.join(self._bench_dir, "tasks.json")
 
-        # Execute-stage GT lives in the benchmark repo (private to benchmark, not in capsules)
         self._gt_path = os.path.join(self._bench_dir, "ground_truth", "execute_ground_truth.json")
 
-        # IMPORTANT: call BaseBenchmark init first, then load tasks.
-        # Otherwise BaseBenchmark may reset self.benchmark and you end up with 0 tasks.
         try:
             super().__init__(
                 agent_dir,
@@ -148,7 +104,6 @@ class ReplicatorBenchmark(BaseBenchmark):
         except TypeError:
             super().__init__(agent_dir, config)
 
-        # Now load tasks/GT after BaseBenchmark init
         self._load_tasks()
         self._load_ground_truth()
 
@@ -168,7 +123,6 @@ class ReplicatorBenchmark(BaseBenchmark):
         tasks: List[Dict[str, Any]] = payload["tasks"]
         seen_ids = set()
 
-        # task_id -> {"capsule_id": ..., "stage": ...}
         self._task_meta: Dict[str, Dict[str, str]] = {}
 
         def _infer_stage(task_id: str) -> str:
@@ -225,7 +179,6 @@ class ReplicatorBenchmark(BaseBenchmark):
                 "capsule_subdir": capsule_subdir,
             }
 
-            # Register the task with HAL (this is what actually creates runnable tasks)
             self.benchmark[task_id] = {
                 "prompt": prompt,
                 "files": {},   # capsules are handled by setup.sh; no per-task file mapping needed here
@@ -233,18 +186,6 @@ class ReplicatorBenchmark(BaseBenchmark):
             }
 
     def _load_ground_truth(self) -> None:
-        """
-        execute_ground_truth.json:
-        {
-          "replicatorbench_01": {
-            "label": "met",
-            "criterion": {"alpha": 0.05, "expected_direction": "positive"},
-            "expected_primary_effect": {"value": 0.12, "p_value": 0.03, "direction": "positive"},
-            "tolerances": {"value_abs": 0.05, "p_value_abs": 0.05}
-          },
-          ...
-        }
-        """
         if not os.path.exists(self._gt_path):
             self._ground_truth = {}
             return
@@ -336,12 +277,7 @@ class ReplicatorBenchmark(BaseBenchmark):
         return est, pval, direction
 
     def _canonical_task_dir(self, task_id: str) -> str:
-        """
-        Canonical shared output directory.
 
-        We write ALL stage outputs for a study under:
-          /workspace/<capsule_id>/
-        """
         meta = getattr(self, "_task_meta", {}) or {}
         capsule_id = (meta.get(task_id) or {}).get("capsule_id") or task_id
         return os.path.join(self.TARGET_ROOT, capsule_id)
@@ -453,26 +389,6 @@ class ReplicatorBenchmark(BaseBenchmark):
         return eval_summary
             
     
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
     def _evaluate_task(
         self, task_id: str, parsed_ptr: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
@@ -484,7 +400,6 @@ class ReplicatorBenchmark(BaseBenchmark):
 
         Ground-truth (GT) is fetched at evaluation time into:
         /workspace/_replicatorbench_gt/<capsule_id>/
-        (NOT exposed to agents via tasks.json).
         """
         import shutil
         from urllib.request import Request, urlopen
@@ -495,15 +410,10 @@ class ReplicatorBenchmark(BaseBenchmark):
 
         capsule_id = task_meta.get("capsule_id") or task_id
 
-        # Inputs live here (agent can read; do not write here)
         capsule_inputs_dir = os.path.join(self.TARGET_ROOT, "capsules", capsule_id)
 
-        # Outputs + llm_eval live here (agent writes here; evaluator writes llm_eval here)
         out_dir = self._canonical_task_dir(task_id)
 
-        # -----------------------------
-        # Presence/type checks
-        # -----------------------------
         extract_checks = [
             self._stage_check_json(task_id, "extract", "post_registration.json", parsed_ptr, allow_list=False),
             self._stage_check_json(task_id, "extract", "merged-urls.json", parsed_ptr, allow_list=True),
@@ -516,9 +426,6 @@ class ReplicatorBenchmark(BaseBenchmark):
             self._stage_check_json(task_id, "interpret", "interpret_results.json", parsed_ptr, allow_list=False),
         ]
 
-        # -----------------------------
-        # Helpers: derive + download GT
-        # -----------------------------
         def _repo_slug_from_url(capsule_url: str) -> str:
             # https://github.com/org/repo(.git) -> org/repo
             s = (capsule_url or "").strip()
@@ -544,7 +451,6 @@ class ReplicatorBenchmark(BaseBenchmark):
             except (HTTPError, URLError):
                 return False
 
-        # GT fetch config (HAL/eval-only env vars)
         GT_REPO_SLUG = os.getenv("REPLICATORBENCH_GT_REPO_SLUG", "").strip()
         GT_REF_OVERRIDE = os.getenv("REPLICATORBENCH_GT_REF", "").strip()
         GT_TOKEN = os.getenv("REPLICATORBENCH_GT_TOKEN", "").strip()
@@ -556,12 +462,11 @@ class ReplicatorBenchmark(BaseBenchmark):
         gt_ready = False
         gt_note = None
 
-        # Compute gt_subdir by swapping .../input -> .../gt
         gt_subdir = None
         if capsule_subdir.endswith("/input"):
             gt_subdir = capsule_subdir[: -len("/input")] + "/gt"
 
-        # GT local cache dir
+
         gt_dir = os.path.join(self.TARGET_ROOT, "_replicatorbench_gt", capsule_id)
         os.makedirs(gt_dir, exist_ok=True)
 
@@ -579,7 +484,6 @@ class ReplicatorBenchmark(BaseBenchmark):
         else:
             repo_slug = _repo_slug_from_url(capsule_url) if capsule_url else ""
 
-        # Download GT files only during the INTERPRET task (prevents GT cache from leaking to later stages)
         stage = (task_meta.get("stage") or "").strip()
 
         if stage != "interpret":
@@ -657,8 +561,6 @@ class ReplicatorBenchmark(BaseBenchmark):
             except Exception:
                 pass
 
-        # Execute evaluator needs BOTH claim files (in capsule inputs) and agent files (in out_dir).
-        # Easiest: symlink capsule inputs into out_dir so run_evaluate_execute(out_dir) can see everything.
         try:
             if execute_check["ok"]:
                 if os.path.isdir(capsule_inputs_dir):
