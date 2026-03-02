@@ -1,185 +1,3 @@
-import os
-import pymupdf
-import json
-import pandas as pd
-import pyreadr
-import io
-import re
-import docx
-from pathlib import Path
-from hal.benchmarks.replicatorbench.core.utils import get_logger
-from hal.benchmarks.replicatorbench.core.tools import read_and_summarize_pdf
-import tiktoken
-
-from openai import OpenAI
-from hal.benchmarks.replicatorbench.constants import API_KEY
-
-
-client = OpenAI(api_key=API_KEY)
-logger, formatter = get_logger()
-
-def find_required_file(study_path: str, filename: str) -> str:
-    """
-    Finds filename inside study_path (direct child first, then recursive).
-    """
-    direct = os.path.join(study_path, filename)
-    if os.path.exists(direct):
-        return direct
-
-    for root, _, files in os.walk(study_path):
-        if filename in files:
-            return os.path.join(root, filename)
-
-    raise FileNotFoundError(f"Required file not found: {filename} under {study_path}")
-
-
-
-def read_txt(file_path, model_name: str = "gpt-4o"):
-    file_path = str(file_path)
-    if not file_path.endswith(".txt"):
-        return "not a .txt file"
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        file_content = f.read()
-    return check_long_logs(file_content, model_name=model_name)
-
-def check_long_logs(full_doc_content: str, model_name: str = "gpt-4o"):
-    """
-    Tool: read a potentially very long log. If too big, chunk and summarize progressively.
-    Returns a string (full text or summarized).
-    """
-    def _count_tokens(text: str, model_name="gpt-4o") -> int:
-        try:
-            enc = tiktoken.encoding_for_model(model_name if model_name else "gpt-4")
-        except Exception:
-            enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
-    
-    MAX_TOKENS = 20000
-    if _count_tokens(full_doc_content, model_name=model_name) <= MAX_TOKENS:
-        return full_doc_content
-    
-    print(f"Document has > 20000 tokens. Summarizing content to prevent overflow...")
-
-    # Chunk + summarize
-    # lines = full_doc_content.splitlines(keepends=True)
-    # chunk_size = 800  # lines per chunk (tweakable)
-    # chunks = ["".join(lines[i:i+chunk_size]) for i in range(0, len(lines), chunk_size)]
-    chunk_size = 12000
-    chunks = [full_doc_content[i:i+chunk_size] for i in range(0, len(full_doc_content), chunk_size)]
-
-    sys_prompt = (
-        "You are an effective file reader. Summarize the provided log chunk. "
-        "Focus on errors, exceptions, warnings, commands executed, and results."
-    )
-
-    running_summary = "No logs read yet."
-    for idx, chunk in enumerate(chunks, 1):
-        print(f"Summarizing {idx}/{len(chunks)} chunks")
-        user_content = (
-            f"--- EXISTING SUMMARY (Context from previous {idx-1} chunks) ---\n"
-            f"{running_summary}\n\n"
-            f"--- NEW LOG CHUNK ({idx}/{len(chunks)}) ---\n"
-            f"{chunk}"
-            f"Only return the summary of the new log chunk."
-        )
-        messages = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_content}
-        ]
-        try:
-            out = client.chat.completions.create(
-                model=model_name,
-                temperature=0,
-                messages=messages
-            )
-            running_summary += "\n" + (out.choices[0].message.content or "")
-            #running_summary.append(out.choices[0].message.content)
-        except Exception as e:
-            running_summary += f"\n[Error processing chunk {idx}: {e}]"
-
-
-    return running_summary
-    
-def read_docx(file_path: str, model_name: str = "gpt-4o") -> str:
-    try:
-        doc = docx.Document(file_path)
-        # Extract text from each paragraph and join with a newline
-        full_text = [para.text for para in doc.paragraphs]
-        full_text = '\n'.join(full_text)
-        return check_long_logs(full_text, model_name)
-    except FileNotFoundError:
-        return f"Error: The file at {file_path} was not found."
-    except Exception as e:
-        # This can catch errors from corrupted or non-standard docx files
-        return f"An error occurred while reading the docx file: {e}"
-
-
-def read_json(file_path, model_name: str = "gpt-4o"):
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        json_str =  json.dumps(data, indent=2)
-        return check_long_logs(json_str)
-    except Exception as e:
-        return f"[JSON read error: {e}]"
-
-
-def read_csv(file_path):
-    try:
-        df = pd.read_csv(file_path)
-        return df.to_string(index=False)
-    except Exception as e:
-        return f"[CSV read error: {e}]"
-
-    
-    
-
-def save_output(extracted_json, study_path, stage):
-    if stage == "stage_1":
-        output_filename = "post_registration.json"
-    elif stage == "stage_2":
-        output_filename = "replication_info.json"
-
-
-    output_path = os.path.join(study_path, output_filename)
-    try:
-        with open(output_path, 'w', encoding="utf-8") as f:
-            json.dump(extracted_json, f, indent=2)
-        print(f"[INFO] Stage '{stage}' output saved to {output_path}")
-    except Exception as e:
-        print(f"[ERROR] Failed to save output for stage {stage}: {e}")
-        logger.exception(f"Failed to save output for stage {stage}: {e}")
-    
-
-def save_prompt_log(study_path, stage, prompt, full_message):
-									   
-    case_name = os.path.basename(os.path.normpath(study_path))
-    
-    if "case_study" not in case_name:
-        match = re.search(r"case_study_\d+", study_path)
-        if match:
-            case_name = match.group()
-
-					   
-    log_dir = "logs"
-												
-    os.makedirs(log_dir, exist_ok=True)
-
-				   
-    log_file = os.path.join(log_dir, f"{case_name}_{stage}_log.txt")
-
-				  
-    with open(log_file, "w", encoding="utf-8") as f:
-        f.write("=== GENERATED PROMPT ===\n")
-        f.write(prompt + "\n\n")
-        f.write("=== GENERATED FULL MESSAGE ===\n")
-        f.write(full_message + "\n")
-
-    print(f"[INFO] Prompt and message logged to {log_file}")
-
-
-
-
 import base64
 from openai import OpenAI
 import os
@@ -421,6 +239,28 @@ def read_image(file_path):
 
 
 
+def ask_human_input(question: str) -> str:
+    """
+    Prompts the human user for input in the terminal.
+
+    Use this tool when you are stuck, need clarification, or require 
+    information that you cannot find or deduce from the available files.
+
+    Args:
+        question_to_ask (str): The clear, specific question to ask the human user.
+
+    Returns:
+        str: The human's response from the terminal.
+    """
+    # Print a clear message to the user indicating the agent needs help
+    print("\n🤔 [AGENT NEEDS HUMAN INPUT] 🤔")
+    print(f"Agent's Question: {question}")
+    
+    # Get input from the user
+    human_response = input("Your Response: ")
+    
+    return human_response
+
 def list_files_in_folder(study_path, folder_path: str) -> str:
     """
     Recursively lists all files within a specified folder and its subfolders.
@@ -474,10 +314,181 @@ def list_files_in_folder(study_path, folder_path: str) -> str:
     file_info += "All files:\n" + "\n".join(file_paths)
     return file_info
 
+from pathlib import Path
+
+def write_file(file_path: str, file_content: str, overwrite: bool = False) -> str:
+    """
+    Create a NEW file (default) or overwrite an existing file only if overwrite=True.
+    """
+    full_path = Path.cwd() / file_path
+
+    file_exists = full_path.exists()
+
+    print("\n📝 [AGENT ASKS TO WRITE FILE] 📝")
+    print(f"FULL PATH: {full_path}")
+    print(f"EXISTS ALREADY?: {file_exists}")
+    print(f"OVERWRITE FLAG?: {overwrite}")
+    print(f"FILE CONTENT:\n---\n{file_content}\n---")
+
+    if file_exists and not overwrite:
+        msg = (
+            "❌ Refusing to overwrite an existing file. "
+            "Use edit_file(...) for targeted edits, or call write_file(..., overwrite=True)."
+        )
+        print(msg)
+        return msg
+
+    user_response = input("Do you approve? (yes/no): ")
+    if user_response.lower().strip() != "yes":
+        print("❌ User denied execution.")
+        return f"Command execution denied by the user:\n{user_response}"
+
+    try:
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(file_content)
+        success_message = f"✅ Successfully wrote content to {full_path}"
+        print(success_message)
+        return success_message
+    except Exception as e:
+        error_message = f"❌ Error writing file to {full_path}: {e}"
+        print(error_message)
+        return error_message
+
+
+def read_file(file_path: str, max_chars: int = 20000) -> str:
+    """
+    Read a text file (truncated) so the agent can make targeted edits.
+    """
+    full_path = Path.cwd() / file_path
+
+    if not full_path.exists():
+        return f"Error: File not found: {full_path}"
+    if full_path.is_dir():
+        return f"Error: Path is a directory: {full_path}"
+
+    try:
+        content = full_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        content = full_path.read_text(encoding="latin-1")
+
+    if len(content) > max_chars:
+        return content[:max_chars] + f"\n\n... [TRUNCATED {len(content)-max_chars} chars] ..."
+    return content
 
 
 
+def edit_file(
+    file_path: str,
+    edit_type: str,
+    *,
+    old_text: str = None,
+    new_text: str = None,
+    start_marker: str = None,
+    end_marker: str = None,
+    anchor: str = None,
+    insert_text: str = None,
+    count: int = 1,
+) -> str:
+    """
+    Targeted edits WITHOUT overwriting the whole file.
+    Shows a unified diff and requires approval.
 
+    edit_type:
+      - "replace"
+      - "replace_between" (markers kept; content between replaced)
+      - "insert_after"
+      - "insert_before"
+      - "append"
+      - "prepend"
+    """
+    full_path = Path.cwd() / file_path
+
+    if not full_path.exists():
+        return f"Error: File not found: {full_path}"
+    if full_path.is_dir():
+        return f"Error: Path is a directory: {full_path}"
+
+    try:
+        original = full_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        original = full_path.read_text(encoding="latin-1")
+
+    edited = original
+
+    if edit_type == "replace":
+        if old_text is None or new_text is None:
+            return "Error: replace requires old_text and new_text."
+        if old_text not in edited:
+            return "Error: old_text not found."
+        edited = edited.replace(old_text, new_text, count)
+
+    elif edit_type == "replace_between":
+        if start_marker is None or end_marker is None or new_text is None:
+            return "Error: replace_between requires start_marker, end_marker, and new_text."
+        s = edited.find(start_marker)
+        if s == -1:
+            return "Error: start_marker not found."
+        e = edited.find(end_marker, s + len(start_marker))
+        if e == -1:
+            return "Error: end_marker not found (after start_marker)."
+        between_start = s + len(start_marker)
+        between_end = e
+        edited = edited[:between_start] + new_text + edited[between_end:]
+
+    elif edit_type in ("insert_after", "insert_before"):
+        if anchor is None or insert_text is None:
+            return f"Error: {edit_type} requires anchor and insert_text."
+        idx = edited.find(anchor)
+        if idx == -1:
+            return "Error: anchor not found."
+        insert_at = idx + len(anchor) if edit_type == "insert_after" else idx
+        edited = edited[:insert_at] + insert_text + edited[insert_at:]
+
+    elif edit_type == "append":
+        if insert_text is None:
+            return "Error: append requires insert_text."
+        if edited and not edited.endswith("\n"):
+            edited += "\n"
+        edited += insert_text
+
+    elif edit_type == "prepend":
+        if insert_text is None:
+            return "Error: prepend requires insert_text."
+        edited = insert_text + ("" if insert_text.endswith("\n") else "\n") + edited
+
+    else:
+        return f"Error: Unknown edit_type '{edit_type}'."
+
+    if edited == original:
+        return "No changes made."
+
+    diff = "\n".join(
+        difflib.unified_diff(
+            original.splitlines(),
+            edited.splitlines(),
+            fromfile=str(full_path) + " (before)",
+            tofile=str(full_path) + " (after)",
+            lineterm="",
+        )
+    )
+
+    print("\n✍️ [AGENT PROPOSES A FILE EDIT] ✍️")
+    print(f"FULL PATH: {full_path}")
+    print(f"DIFF:\n---\n{diff}\n---")
+
+    user_response = input("Do you approve this edit? (yes/no): ")
+    if user_response.lower().strip() != "yes":
+        print("❌ User denied edit.")
+        return f"Edit denied by the user:\n{user_response}"
+
+    try:
+        full_path.write_text(edited, encoding="utf-8")
+        msg = f"✅ Successfully edited {full_path}"
+        print(msg)
+        return msg
+    except Exception as e:
+        return f"❌ Error writing edited file to {full_path}: {e}"
 
 data_summarizer_prompt = (
 "You are a careful technical paper summarizer. "
@@ -491,7 +502,7 @@ normal_summarization_prompt = (
 )
 
 
-def read_pdf(file_path: str, summarizer_model: str="gpt-4o", for_data: bool=False) -> str:
+def read_and_summarize_pdf(file_path: str, summarizer_model: str="gpt-4o", for_data: bool=False) -> str:
     """
     Reads a PDF file. If the PDF is short (<= 15 pages), it returns the full text.
     If the PDF is long (> 15 pages), it splits the text into chunks and uses the
@@ -557,25 +568,3 @@ def read_pdf(file_path: str, summarizer_model: str="gpt-4o", for_data: bool=Fals
 
     except Exception as e:
         return f"Error reading or summarizing PDF: {e}"
-    
-def ask_human_input(question: str) -> str:
-    """
-    Prompts the human user for input in the terminal.
-
-    Use this tool when you are stuck, need clarification, or require 
-    information that you cannot find or deduce from the available files.
-
-    Args:
-        question_to_ask (str): The clear, specific question to ask the human user.
-
-    Returns:
-        str: The human's response from the terminal.
-    """
-    # Print a clear message to the user indicating the agent needs help
-    print("\n🤔 [AGENT NEEDS HUMAN INPUT] 🤔")
-    print(f"Agent's Question: {question}")
-    
-    # Get input from the user
-    human_response = input("Your Response: ")
-    
-    return human_response

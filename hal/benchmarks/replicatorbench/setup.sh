@@ -1,7 +1,35 @@
 #!/bin/bash
+
+# Ensure /workspace exists
+mkdir -p /workspace
+
+# Link the container's built-in runner into /workspace so docker_runner can execute it
+if [ ! -f /workspace/run_agent.py ]; then
+  for cand in \
+    /root/environment/workspace/run_agent.py \
+    /root/environment/workspace/hal/run_agent.py \
+    /root/environment/workspace/hal-harness/run_agent.py
+  do
+    if [ -f "$cand" ]; then
+      ln -sf "$cand" /workspace/run_agent.py
+      break
+    fi
+  done
+fi
+
 set -euo pipefail
 
-echo "[replicatorbench] setup.sh starting..."
+# --- Hard-disable Weave by shadowing the module (prevents any wandb login) ---
+cat > /workspace/weave.py <<'PY'
+from contextlib import contextmanager
+
+def init(*args, **kwargs):
+    return None
+
+@contextmanager
+def attributes(*args, **kwargs):
+    yield
+PY
 
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TASKS_JSON="${BENCH_DIR}/tasks.json"
@@ -12,7 +40,7 @@ if [[ ! -f "${TASKS_JSON}" ]]; then
 fi
 
 # --- workspace inside HAL environment ---
-ROOT="/root/environment/workspace"
+ROOT="/workspace"
 CAPS_DIR="${ROOT}/capsules"
 mkdir -p "${CAPS_DIR}"
 
@@ -270,6 +298,8 @@ while IFS=$'\t' read -r task_id capsule_id capsule_type capsule_url capsule_sha2
     echo "[replicatorbench] ${capsule_id}: capsule ready at ${out_dir}"
   fi
 
+printf "\n===========[replicatorbench][setup] task_id=%s capsule_id=%s\n\n" "${task_id}" "${capsule_id}" >&2
+
 done < <(python3 - "${TASKS_JSON}" <<'PY'
 import json, sys
 
@@ -302,4 +332,4 @@ for t in tasks:
 PY
 )
 
-echo "[replicatorbench] setup.sh complete."
+echo -e "\n========== [replicatorbench][setup] END container=${CID} time=$(date -Is) ==========\n" >&2
