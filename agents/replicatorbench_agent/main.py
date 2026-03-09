@@ -243,7 +243,6 @@ def _ensure_prereqs(stage: str, cwd: str, env: Dict[str, str], study_dir: str, m
     repl = os.path.join(study_dir, "replication_info.json")
     exec_res = os.path.join(study_dir, "execution_results.json")
 
-    # Even extract and web_search should have both early-stage artifacts
     if stage in ("extract", "web_search", "design", "execute", "interpret"):
         if not os.path.exists(post_reg):
             _run_make_target(cwd, env, study_dir, model, "extract-stage1")
